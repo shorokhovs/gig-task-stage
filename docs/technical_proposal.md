@@ -103,7 +103,7 @@ Connectivity between on-prem MySQL and AWS RDS should use private networking:
 - Route 53 private hosted zones for stable internal names.
 
 For AWS DMS, the migration worker is the DMS replication instance. I would place
-this replication instance in AWS, in the same VPC and close to the target RDS
+this replication instance in the same VPC and close to the target RDS
 PostgreSQL instance. It should connect to on-prem MySQL over Direct Connect or
 VPN using private routing. A custom EC2 worker would be used only for a
 non-DMS approach, for example Debezium or a custom binlog pipeline. The network
