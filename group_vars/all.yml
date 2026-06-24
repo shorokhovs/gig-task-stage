@@ -1,0 +1,14 @@
+compose_project_name: gig_refactor_lab
+postgres_service: postgres
+postgres_container: gig-refactor-postgres
+postgres_host_port: 55432
+postgres_superuser: postgres
+postgres_superuser_password: postgres_admin_password
+
+lab_db: GIG_REFACTOR_LAB
+lab_admin_user: gig_admin
+lab_admin_password: change_me_in_real_life
+
+target_row_count: 1000000
+migration_batch_size: 25000
+migration_throttle_seconds: 0.2

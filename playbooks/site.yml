@@ -1,0 +1,113 @@
+---
+- name: Build the GIG refactor lab
+  hosts: local
+  gather_facts: false
+
+  vars:
+    compose_file: "{{ playbook_dir }}/../docker-compose.yml"
+    psql_superuser: >-
+      docker compose -p {{ compose_project_name }} -f {{ compose_file }}
+      exec -T {{ postgres_service }} psql -U {{ postgres_superuser }} -d postgres
+      -v ON_ERROR_STOP=1
+    psql_lab: >-
+      docker compose -p {{ compose_project_name }} -f {{ compose_file }}
+      exec -T {{ postgres_service }} psql -U {{ postgres_superuser }} -d {{ lab_db }}
+      -v ON_ERROR_STOP=1
+
+  tasks:
+    - name: Validate numeric lab parameters
+      ansible.builtin.assert:
+        that:
+          - target_row_count is match('^[1-9][0-9]*$')
+          - migration_batch_size is match('^[1-9][0-9]*$')
+          - migration_throttle_seconds is match('^[0-9]+(\\.[0-9]+)?$')
+        fail_msg: >-
+          target_row_count and migration_batch_size must be positive integers.
+          migration_throttle_seconds must be a non-negative number.
+
+    - name: Start PostgreSQL 16 container
+      ansible.builtin.command:
+        cmd: docker compose -p {{ compose_project_name }} -f {{ compose_file }} up -d
+      changed_when: "'Started' in compose_up.stdout or 'Created' in compose_up.stdout or 'Recreated' in compose_up.stdout"
+      register: compose_up
+
+    - name: Wait for PostgreSQL port
+      ansible.builtin.wait_for:
+        host: "127.0.0.1"
+        port: "{{ postgres_host_port }}"
+        timeout: 120
+
+    - name: Create application role idempotently
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_superuser }}
+          -c "DO $$ BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ lab_admin_user }}') THEN
+                  CREATE ROLE {{ lab_admin_user }} LOGIN PASSWORD '{{ lab_admin_password }}';
+                END IF;
+              END $$;"
+      register: create_role
+      changed_when: "'CREATE ROLE' in create_role.stdout"
+
+    - name: Check whether lab database exists
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_superuser }}
+          -tAc "SELECT 1 FROM pg_database WHERE datname='{{ lab_db }}'"
+      register: lab_db_exists
+      changed_when: false
+
+    - name: Create lab database
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_superuser }}
+          -c "CREATE DATABASE \"{{ lab_db }}\" OWNER {{ lab_admin_user }}"
+      when: lab_db_exists.stdout | trim != "1"
+
+    - name: Apply legacy schema and data generation
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_lab }}
+          -v target_row_count={{ target_row_count }}
+          -f /automation/sql/01_legacy_data.sql
+      register: legacy_data
+      changed_when: "'INSERT 0' in legacy_data.stdout or 'CREATE TABLE' in legacy_data.stdout"
+
+    - name: Apply partitioned schema
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_lab }}
+          -f /automation/sql/02_partitioned_schema.sql
+      register: partitioned_schema
+      changed_when: "'CREATE TABLE' in partitioned_schema.stdout"
+
+    - name: Run throttled batch migration
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_lab }}
+          -v batch_size={{ migration_batch_size }}
+          -v throttle_seconds={{ migration_throttle_seconds }}
+          -f /automation/sql/03_batch_migration.sql
+      register: batch_migration
+      changed_when: "'migrated_rows' in batch_migration.stdout"
+
+    - name: Validate migrated row counts and drop legacy table
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_lab }}
+          -f /automation/sql/04_validate_and_finalize.sql
+      register: validation
+      changed_when: "'DROP TABLE' in validation.stdout"
+
+    - name: Grant lab admin access to final objects
+      ansible.builtin.command:
+        cmd: >-
+          {{ psql_lab }}
+          -c "GRANT USAGE, CREATE ON SCHEMA public TO {{ lab_admin_user }};
+              GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {{ lab_admin_user }};
+              GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {{ lab_admin_user }};"
+      changed_when: false
+
+    - name: Show validation summary
+      ansible.builtin.debug:
+        msg: "{{ validation.stdout_lines }}"
